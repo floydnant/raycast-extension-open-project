@@ -11,11 +11,13 @@ import { entriesOf } from "./utils";
 
 const home = os.homedir();
 
+// @TODO: this should be configurable
 const configFolderName = ".flo-cli";
 const configFileName = "flo-cli.jsonc";
 const configFolderPath = path.join(home, ".config", configFolderName);
 const configFilePath = path.join(configFolderPath, configFileName);
 
+// @TODO: this should be configurable
 const baseProjectPath = `${home}/coding/`;
 
 export const fixBranchName = (branch: string) =>
