@@ -184,9 +184,13 @@ const ProjectList = ({
         flatProjects.map((project) => (
           <List.Item
             key={project.name + project.directory}
-            title={project.name}
+            title={project.name.replace(/_|-/g, " ")}
             subtitle={`<${project.branch}>   ${project.directory.replace(baseProjectPath, "")}`}
-            keywords={[project.branch || "", ...project.directory.replace(baseProjectPath, "").split("/")]}
+            keywords={[
+              project.branch || "",
+              project.name,
+              ...project.directory.replace(baseProjectPath, "").split("/"),
+            ]}
             actions={<ActionPanel>{...getProjectActions({ project })}</ActionPanel>}
           />
         ))
