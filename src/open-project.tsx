@@ -83,8 +83,8 @@ type ProjectDirectory = {
   directory: string;
   name: string;
   branch: string | null;
-  getSubProjects: (() => Promise<ProjectDirectory[]>) | null;
-  subProjects?: ProjectDirectory[];
+  getSubProjects: (() => Promise<(ProjectDirectory & { isDirty: boolean })[]>) | null;
+  subProjects?: (ProjectDirectory & { isDirty: boolean })[];
 };
 
 const getProjects = async (): Promise<ProjectDirectory[] | null> => {
@@ -105,18 +105,30 @@ const getProjects = async (): Promise<ProjectDirectory[] | null> => {
         entriesOf(validationResult.data.projects).map(async ([name, config]) => {
           const getSubProjects = async () => {
             const rawOutput = await new Promise<string>((res, rej) =>
-              exec(`git worktree list --porcelain`, { cwd: config.root }, (err, stdout, _stderr) =>
+              exec(`git worktree list --porcelain`, { cwd: config.root }, (err, stdout) =>
                 err ? rej(err) : res(stdout),
               ),
             ).catch(() => "");
             const worktrees = parseWorktreeList(config.root, rawOutput);
 
-            return worktrees.map((worktree) => ({
-              name: worktree.branch || worktree.head || "Bare",
-              directory: worktree.directory,
-              getSubProjects: null,
-              branch: worktree.branch || worktree.head || "Bare",
-            }));
+            return await Promise.all(
+              worktrees.map(async (worktree) => {
+                const isDirty = await new Promise<boolean>((res, rej) =>
+                  exec(`git status --short`, { cwd: worktree.directory }, (err, stdout) => {
+                    if (err) rej(err);
+                    else res(stdout ? true : false);
+                  }),
+                ).catch(() => false);
+
+                return {
+                  name: worktree.branch || worktree.head || "Bare",
+                  directory: worktree.directory,
+                  getSubProjects: null,
+                  branch: worktree.branch || worktree.head || "Bare",
+                  isDirty,
+                };
+              }),
+            );
           };
           const subprojects = await getSubProjects();
 
@@ -170,12 +182,13 @@ const ProjectList = ({
 }) => {
   const flatProjects = projectsResult?.data?.flatMap((project) => {
     return (
-      project.subProjects?.map<ProjectDirectory & { isMainWorktree: boolean }>((subProject) => ({
+      project.subProjects?.map<ProjectDirectory & { isMainWorktree: boolean; isDirty: boolean }>((subProject) => ({
         name: project.name,
         directory: subProject.directory,
         branch: subProject.branch,
         isMainWorktree: project.directory == subProject.directory,
         getSubProjects: null,
+        isDirty: subProject.isDirty,
       })) || []
     );
   });
@@ -186,7 +199,7 @@ const ProjectList = ({
         flatProjects.map((project) => (
           <List.Item
             key={project.name + project.directory}
-            title={project.name.replace(/_|-/g, " ")}
+            title={project.name.replace(/_|-/g, " ") + (project.isDirty ? " 🚧" : "")}
             subtitle={`<${project.branch}>   ${project.directory.replace(baseProjectPath, "")}`}
             keywords={[
               project.branch || "",
