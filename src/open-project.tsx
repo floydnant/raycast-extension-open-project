@@ -104,12 +104,24 @@ const getProjects = async (): Promise<ProjectDirectory[] | null> => {
     ? await Promise.all(
         entriesOf(validationResult.data.projects).map(async ([name, config]) => {
           const getSubProjects = async () => {
-            const rawOutput = await new Promise<string>((res, rej) =>
+            const rawWorktreeListOutput = await new Promise<string>((res, rej) =>
               exec(`git worktree list --porcelain`, { cwd: config.root }, (err, stdout) =>
                 err ? rej(err) : res(stdout),
               ),
             ).catch(() => "");
-            const worktrees = parseWorktreeList(config.root, rawOutput);
+            const worktrees = parseWorktreeList(config.root, rawWorktreeListOutput);
+
+            if (worktrees.length == 0) {
+              return [
+                {
+                  name,
+                  directory: config.root,
+                  getSubProjects: null,
+                  branch: "not a git repository",
+                  isDirty: false,
+                },
+              ];
+            }
 
             return await Promise.all(
               worktrees.map(async (worktree) => {
