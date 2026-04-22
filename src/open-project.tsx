@@ -76,6 +76,7 @@ const parseWorktreeList = (projectRoot: string, rawOutput: string) => {
 };
 
 const configSchema = z.object({
+  projectsDirs: z.string().array().optional(),
   projects: z.record(z.string(), z.object({ root: z.string() })),
 });
 
@@ -100,9 +101,33 @@ const getProjects = async (): Promise<ProjectDirectory[] | null> => {
       message: `Check if a file exists at ${configFilePath}`,
     });
 
+  const implicitProjectFolderEntries = await Promise.all(
+    (validationResult.success ? validationResult.data.projectsDirs || [] : []).map(async (dir) => {
+      const resolvedDir = path.resolve(dir);
+      const entries = await fs.readdir(resolvedDir, { withFileTypes: true });
+      const subfolders = entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => [entry.name, { root: path.join(resolvedDir, entry.name) }] as const);
+
+      return subfolders;
+    }),
+  ).then((arrays) => arrays.flat());
+  const seenProjectRoots = new Set<string>();
+  const projectFolderEntries = validationResult.success
+    ? [...entriesOf(validationResult.data.projects), ...implicitProjectFolderEntries].filter(([_, config]) => {
+        const root = path.normalize(config.root);
+        if (seenProjectRoots.has(root)) {
+          return false;
+        } else {
+          seenProjectRoots.add(root);
+          return true;
+        }
+      })
+    : [];
+
   const projects = validationResult.success
     ? await Promise.all(
-        entriesOf(validationResult.data.projects).map(async ([name, config]) => {
+        projectFolderEntries.map(async ([name, config]) => {
           const getSubProjects = async () => {
             const rawWorktreeListOutput = await new Promise<string>((res, rej) =>
               exec(`git worktree list --porcelain`, { cwd: config.root }, (err, stdout) =>
