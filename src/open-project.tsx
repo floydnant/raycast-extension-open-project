@@ -239,8 +239,9 @@ const ProjectList = ({
             title={project.name.replace(/_|-/g, " ") + (project.isDirty ? " 🚧" : "")}
             subtitle={`<${project.branch}>   ${project.directory.replace(baseProjectPath, "")}`}
             keywords={[
-              project.branch || "",
               project.name,
+              ...(project.branch?.split(/\W|_/) || []),
+              project.branch || "",
               ...project.directory.replace(baseProjectPath, "").split("/"),
             ]}
             actions={<ActionPanel>{...getProjectActions({ project })}</ActionPanel>}
