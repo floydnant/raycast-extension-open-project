@@ -80,12 +80,41 @@ const configSchema = z.object({
   projects: z.record(z.string(), z.object({ root: z.string() })),
 });
 
+type RemoteGitUrl = {
+  gitUrl?: string;
+  httpUrl: string;
+};
+
 type ProjectDirectory = {
   directory: string;
   name: string;
   branch: string | null;
-  getSubProjects: (() => Promise<(ProjectDirectory & { isDirty: boolean })[]>) | null;
   subProjects?: (ProjectDirectory & { isDirty: boolean })[];
+  remoteUrl: RemoteGitUrl | null;
+};
+
+const getRemoteGitUrl = async (directory: string): Promise<RemoteGitUrl | null> => {
+  const url = await new Promise<string | null>((res) =>
+    exec(`git config --get remote.origin.url`, { cwd: directory }, (err, stdout) => {
+      if (err) res(null);
+      else res(stdout.trim());
+    }),
+  )
+    .then((remoteUrl) => remoteUrl)
+    .catch(() => null);
+
+  if (!url) return null;
+
+  if (url.startsWith("http")) {
+    return { httpUrl: url };
+  }
+  if (url.startsWith("git@")) {
+    const [_, domain, path] = url.match(/git@(.+):(.+)\.git/) || [];
+    if (!domain || !path) return null;
+    return { gitUrl: url, httpUrl: `https://${domain}/${path}` };
+  }
+
+  return null;
 };
 
 const getProjects = async (): Promise<ProjectDirectory[] | null> => {
@@ -167,14 +196,14 @@ const getProjects = async (): Promise<ProjectDirectory[] | null> => {
               }),
             );
           };
-          const subprojects = await getSubProjects();
+          const [subprojects, remoteUrl] = await Promise.all([getSubProjects(), getRemoteGitUrl(config.root)]);
 
           return {
             name,
             directory: config.root,
-            getSubProjects: () => Promise.resolve(subprojects),
-            subProjects: subprojects,
+            subProjects: subprojects.map((subProject) => ({ ...subProject, remoteUrl })),
             branch: null,
+            remoteUrl,
           } satisfies ProjectDirectory;
         }),
       )
@@ -192,7 +221,16 @@ const getProjectActions = ({ project }: { project: ProjectDirectory }) => {
       target={project.directory}
     ></Action.Open>,
     <Action.OpenWith title="Open With…" path={project.directory}></Action.OpenWith>,
-    <Action.Open title="Show in Finder" application={"Finder"} target={project.directory}></Action.Open>,
+    <Action.ShowInFinder title="Show in Finder" path={project.directory}></Action.ShowInFinder>,
+    <>
+      {project.remoteUrl && (
+        <Action.OpenInBrowser
+          title="Open Repository"
+          url={project.remoteUrl.httpUrl}
+          shortcut={{ key: "o", modifiers: ["cmd"] }}
+        ></Action.OpenInBrowser>
+      )}
+    </>,
     <Action.CopyToClipboard
       title="Copy Folder Path"
       shortcut={{ key: "c", modifiers: ["cmd"] }}
@@ -226,6 +264,7 @@ const ProjectList = ({
         isMainWorktree: project.directory == subProject.directory,
         getSubProjects: null,
         isDirty: subProject.isDirty,
+        remoteUrl: subProject.remoteUrl,
       })) || []
     );
   });
