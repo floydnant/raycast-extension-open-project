@@ -1,4 +1,4 @@
-import { Action, ActionPanel, Icon, List } from "@raycast/api";
+import { Action, ActionPanel, Alert, confirmAlert, Icon, List, showToast, Toast, trash } from "@raycast/api";
 import { showFailureToast, useCachedPromise } from "@raycast/utils";
 import { exec } from "child_process";
 import fs from "fs/promises";
@@ -22,6 +22,7 @@ export const fixBranchName = (branch: string) =>
 export interface Worktree {
   directory: string;
   isMainWorktree: boolean;
+  mainWorktreeDirectory: string;
 
   branch?: string;
   head?: string;
@@ -33,7 +34,8 @@ export interface Worktree {
   isBare?: boolean;
 }
 
-const parseWorktreeList = (projectRoot: string, rawOutput: string) => {
+const parseWorktreeList = (gitDir: string, rawOutput: string) => {
+  const mainWorktreeDir = gitDir.split("/.git")[0];
   const worktreeTextBlocks = rawOutput.split("\n\n").filter(Boolean);
 
   const worktrees = worktreeTextBlocks.map((block) => {
@@ -48,7 +50,7 @@ const parseWorktreeList = (projectRoot: string, rawOutput: string) => {
     const lockReason = block.match(/^locked .+/m)?.[0].replace("locked ", "");
 
     const isPrunable = /^prunable/m.test(block);
-    const prunableReason = block.match(/^prunable .+/m)?.[0].replace("locked ", "");
+    const prunableReason = block.match(/^prunable .+/m)?.[0].replace("prunable ", "");
 
     // this should never happen, because a worktree always has a directory
     if (!directory) {
@@ -64,7 +66,8 @@ const parseWorktreeList = (projectRoot: string, rawOutput: string) => {
       isDetached,
       isPrunable,
       prunableReason,
-      isMainWorktree: projectRoot == directory,
+      isMainWorktree: mainWorktreeDir == directory,
+      mainWorktreeDirectory: mainWorktreeDir,
     } satisfies Worktree;
   });
 
@@ -86,8 +89,9 @@ type ProjectWorktree = {
   directory: string;
   branch: string;
   isDirty: boolean | null;
-  isMainWorktree: boolean | null;
+  isMainWorktree: boolean;
   isGitRepo: boolean;
+  mainWorktreeDirectory: string;
 };
 type ProjectDirectory = ProjectWorktree & {
   name: string;
@@ -130,41 +134,57 @@ const getRemoteGitUrl = async (directory: string): Promise<RemoteGitUrl | null> 
 };
 
 const getProjectWorktrees = async (directory: string): Promise<ProjectWorktree[]> => {
-  const rawWorktreeListOutput = await new Promise<string>((res, rej) =>
-    exec(`git worktree list --porcelain`, { cwd: directory }, (err, stdout) => (err ? rej(err) : res(stdout))),
-  ).catch(() => "");
-  const worktrees = parseWorktreeList(directory, rawWorktreeListOutput);
+  const [gitDir, rawWorktreeListOutput] = await Promise.all([
+    new Promise<string>((res, rej) =>
+      exec(`git rev-parse --absolute-git-dir`, { cwd: directory }, (err, stdout) => (err ? rej() : res(stdout.trim()))),
+    ),
+    new Promise<string>((res, rej) =>
+      exec(`git worktree list --porcelain`, { cwd: directory }, (err, stdout) => (err ? rej(err) : res(stdout))),
+    ),
+  ]).catch(() => [null, null]);
 
+  const worktrees = rawWorktreeListOutput ? parseWorktreeList(gitDir!, rawWorktreeListOutput) : [];
   if (worktrees.length == 0) {
     return [
       {
         directory: directory,
         branch: "not a git repository",
         isDirty: false,
-        isMainWorktree: null,
+        isMainWorktree: true,
         isGitRepo: false,
+        mainWorktreeDirectory: directory,
       } satisfies ProjectWorktree,
     ];
   }
 
-  return await Promise.all(
+  const projectWorktrees = await Promise.all(
     worktrees.map(async (worktree) => {
-      const isDirty = await new Promise<boolean>((res, rej) =>
-        exec(`git status --short`, { cwd: worktree.directory }, (err, stdout) => {
-          if (err) rej(err);
-          else res(stdout ? true : false);
-        }),
-      ).catch(() => false);
+      const [isDirty, exists] = await Promise.all([
+        new Promise<boolean>((res, _rej) =>
+          exec(`git status --short`, { cwd: worktree.directory }, (err, stdout) => {
+            if (err) res(false);
+            else res(stdout ? true : false);
+          }),
+        ).catch(() => false),
+        fs
+          .stat(worktree.directory)
+          .then(() => true)
+          .catch(() => false),
+      ]);
 
       return {
+        exists: exists,
         directory: worktree.directory,
         branch: worktree.branch || worktree.head || "Bare",
-        isDirty,
+        isDirty: isDirty,
         isMainWorktree: worktree.isMainWorktree,
         isGitRepo: true,
-      } satisfies ProjectWorktree;
+        mainWorktreeDirectory: worktree.mainWorktreeDirectory,
+      } satisfies ProjectWorktree & { exists: boolean };
     }),
   );
+
+  return projectWorktrees.filter((worktree) => worktree.exists);
 };
 
 const readConfig = async (configPath: string) => {
@@ -235,29 +255,40 @@ const readConfig = async (configPath: string) => {
 type ConfigData = NonNullable<Awaited<ReturnType<typeof readConfig>>>;
 
 const getProjects = async (configData: ConfigData): Promise<ProjectDirectory[] | null> => {
-  const projects = (
-    await Promise.all(
-      configData.projectFolderEntries.map(async ([projectName, config]) => {
-        const [worktrees, remoteUrl] = await Promise.all([
-          getProjectWorktrees(config.root),
-          getRemoteGitUrl(config.root),
-        ]);
+  const projects = await Promise.all(
+    configData.projectFolderEntries.map(async ([projectName, config]) => {
+      const [worktrees, remoteUrl] = await Promise.all([
+        getProjectWorktrees(config.root),
+        getRemoteGitUrl(config.root),
+      ]);
 
-        return worktrees
+      return {
+        root: config.root,
+        isMain: worktrees.find((worktree) => worktree.isMainWorktree)?.directory === config.root,
+        worktrees: worktrees
           .filter((worktree) => worktree.isGitRepo || configData.explicitProjectsMap.has(config.root))
           .map((worktree) => ({
             name: projectName,
             remoteUrl,
             ...worktree,
-          }));
-      }),
-    )
-  ).flat();
+          })),
+      };
+    }),
+  );
 
-  return projects;
+  return projects
+    .filter((project) => project.isMain)
+    .map((project) => project.worktrees)
+    .flat();
 };
 
-const ProjectActionPanel = ({ project }: { project: ProjectDirectory }) => {
+const ProjectActionPanel = ({
+  project,
+  onDelete,
+}: {
+  project: ProjectDirectory;
+  onDelete: (project: ProjectDirectory) => void;
+}) => {
   return (
     <ActionPanel title={path.basename(project.directory)}>
       {/* TODO: make this dynamic: allow to open with any installed editor (check individually) */}
@@ -284,7 +315,7 @@ const ProjectActionPanel = ({ project }: { project: ProjectDirectory }) => {
         content={project.directory}
       ></Action.CopyToClipboard>
       <>
-        {project.branch ? (
+        {project.isGitRepo ? (
           <Action.CopyToClipboard
             title="Copy Branch"
             shortcut={{ key: "c", modifiers: ["cmd", "shift"] }}
@@ -294,6 +325,56 @@ const ProjectActionPanel = ({ project }: { project: ProjectDirectory }) => {
           <></>
         )}
       </>
+      <Action
+        title="Delete"
+        style={Action.Style.Destructive}
+        icon={Icon.Trash}
+        shortcut={{ key: "delete", modifiers: ["ctrl"] }}
+        onAction={async () => {
+          const isConfirmed = await confirmAlert({
+            title: "Move to Trash",
+            message: `Are you sure you want to delete ${path.basename(project.directory)}${project.isDirty ? " with UNSAVED CHANGES" : ""}?`,
+            icon: Icon.Trash,
+            dismissAction: {
+              title: "Cancel",
+            },
+            primaryAction: {
+              title: "Move to Trash",
+              style: Alert.ActionStyle.Destructive,
+              onAction() {},
+            },
+          });
+          if (!isConfirmed) return;
+
+          if (project.isMainWorktree) {
+            // TODO: if it's the main worktree, ask to delete all worktrees
+          }
+
+          await trash(project.directory);
+
+          if (project.isGitRepo && !project.isMainWorktree) {
+            await new Promise((res, _rej) =>
+              exec(
+                `git worktree remove "${project.directory}"`,
+                { cwd: project.mainWorktreeDirectory },
+                (err, stdout, stderr) => {
+                  if (err) {
+                    console.error("Error removing worktree:", err, stderr);
+                    res(false);
+                  } else res(true);
+                },
+              ),
+            );
+          }
+
+          showToast({
+            style: Toast.Style.Success,
+            title: "Moved to Trash",
+            message: `${path.basename(project.directory)} has been moved to trash`,
+          });
+          onDelete(project);
+        }}
+      ></Action>
     </ActionPanel>
   );
 };
@@ -327,7 +408,7 @@ export default function Command() {
               project.branch || "",
               ...cleanProjectDirectoryDisplay(project.directory, stripRoots).split("/"),
             ]}
-            actions={<ProjectActionPanel project={project} />}
+            actions={<ProjectActionPanel project={project} onDelete={() => projectsResult.revalidate()} />}
           />
         ))
       ) : (
