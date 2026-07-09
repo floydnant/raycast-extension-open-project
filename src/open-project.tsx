@@ -1,13 +1,12 @@
 import { Action, ActionPanel, Icon, List } from "@raycast/api";
 import { showFailureToast, useCachedPromise } from "@raycast/utils";
-import { UseCachedPromiseReturnType } from "@raycast/utils/dist/types";
 import { exec } from "child_process";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
 import { z } from "zod";
 import { stripJsonComments } from "./strip-json-comments.util";
-import { entriesOf } from "./utils";
+import { entriesOf, valuesOf } from "./utils";
 
 const home = os.homedir();
 
@@ -16,9 +15,6 @@ const configFolderName = ".flo-cli";
 const configFileName = "flo-cli.jsonc";
 const configFolderPath = path.join(home, ".config", configFolderName);
 const configFilePath = path.join(configFolderPath, configFileName);
-
-// @TODO: this should be configurable
-const baseProjectPath = `${home}/coding/`;
 
 export const fixBranchName = (branch: string) =>
   branch.replace("refs/", "").replace("heads/", "").replace("remotes/", "").replace("origin/", "");
@@ -78,6 +74,7 @@ const parseWorktreeList = (projectRoot: string, rawOutput: string) => {
 const configSchema = z.object({
   projectsDirs: z.string().array().optional(),
   projects: z.record(z.string(), z.object({ root: z.string() })),
+  stripRoots: z.string().array().optional(),
 });
 
 type RemoteGitUrl = {
@@ -85,12 +82,27 @@ type RemoteGitUrl = {
   httpUrl: string;
 };
 
-type ProjectDirectory = {
+type ProjectWorktree = {
   directory: string;
+  branch: string;
+  isDirty: boolean | null;
+  isMainWorktree: boolean | null;
+  isGitRepo: boolean;
+};
+type ProjectDirectory = ProjectWorktree & {
   name: string;
-  branch: string | null;
-  subProjects?: (ProjectDirectory & { isDirty: boolean })[];
   remoteUrl: RemoteGitUrl | null;
+};
+
+const cleanProjectDirectoryDisplay = (directory: string, stripRoots: string[]) => {
+  let cleanedDirectory = directory;
+  for (const root of stripRoots) {
+    if (cleanedDirectory.startsWith(root)) {
+      cleanedDirectory = cleanedDirectory.replace(root, "").replace(/^\//, "");
+      break;
+    }
+  }
+  return cleanedDirectory.replace(home, "~");
 };
 
 const getRemoteGitUrl = async (directory: string): Promise<RemoteGitUrl | null> => {
@@ -117,18 +129,75 @@ const getRemoteGitUrl = async (directory: string): Promise<RemoteGitUrl | null> 
   return null;
 };
 
-const getProjects = async (): Promise<ProjectDirectory[] | null> => {
-  const rawConfigFile = await fs.readFile(configFilePath, "utf-8").catch(() => null);
+const getProjectWorktrees = async (directory: string): Promise<ProjectWorktree[]> => {
+  const rawWorktreeListOutput = await new Promise<string>((res, rej) =>
+    exec(`git worktree list --porcelain`, { cwd: directory }, (err, stdout) => (err ? rej(err) : res(stdout))),
+  ).catch(() => "");
+  const worktrees = parseWorktreeList(directory, rawWorktreeListOutput);
+
+  if (worktrees.length == 0) {
+    return [
+      {
+        directory: directory,
+        branch: "not a git repository",
+        isDirty: false,
+        isMainWorktree: null,
+        isGitRepo: false,
+      } satisfies ProjectWorktree,
+    ];
+  }
+
+  return await Promise.all(
+    worktrees.map(async (worktree) => {
+      const isDirty = await new Promise<boolean>((res, rej) =>
+        exec(`git status --short`, { cwd: worktree.directory }, (err, stdout) => {
+          if (err) rej(err);
+          else res(stdout ? true : false);
+        }),
+      ).catch(() => false);
+
+      return {
+        directory: worktree.directory,
+        branch: worktree.branch || worktree.head || "Bare",
+        isDirty,
+        isMainWorktree: worktree.isMainWorktree,
+        isGitRepo: true,
+      } satisfies ProjectWorktree;
+    }),
+  );
+};
+
+const readConfig = async (configPath: string) => {
+  const rawConfigFile = await fs.readFile(configPath, "utf-8").catch((err) => {
+    showFailureToast(err, {
+      title: "Failed to read config file",
+      message: `Check if a file exists at ${configPath}`,
+    });
+    return null;
+  });
   if (!rawConfigFile) return null;
 
   const strippedConfig = stripJsonComments(rawConfigFile, { trailingCommas: true });
-  const parsedConfig = strippedConfig && JSON.parse(strippedConfig);
-  const validationResult = configSchema.safeParse(parsedConfig);
-  if (validationResult.error)
-    showFailureToast(validationResult.error, {
-      title: "Failed to read config file",
-      message: `Check if a file exists at ${configFilePath}`,
+  let parsedConfig = null;
+  try {
+    parsedConfig = strippedConfig && JSON.parse(strippedConfig);
+  } catch (err) {
+    showFailureToast(err, {
+      title: "Config file is invalid JSON",
+      message: `Check the file at ${configPath}`,
     });
+    return null;
+  }
+
+  const validationResult = configSchema.safeParse(parsedConfig);
+  if (validationResult.error) {
+    showFailureToast(validationResult.error, {
+      title: "Config file is not valid according to schema",
+      message: `Check the file at ${configPath}`,
+    });
+
+    return null;
+  }
 
   const implicitProjectFolderEntries = await Promise.all(
     (validationResult.success ? validationResult.data.projectsDirs || [] : []).map(async (dir) => {
@@ -153,137 +222,112 @@ const getProjects = async (): Promise<ProjectDirectory[] | null> => {
         }
       })
     : [];
+  const explicitProjectsMap = validationResult.success
+    ? new Set(valuesOf(validationResult.data.projects).map((project) => project.root))
+    : new Set<string>();
 
-  const projects = validationResult.success
-    ? await Promise.all(
-        projectFolderEntries.map(async ([name, config]) => {
-          const getSubProjects = async () => {
-            const rawWorktreeListOutput = await new Promise<string>((res, rej) =>
-              exec(`git worktree list --porcelain`, { cwd: config.root }, (err, stdout) =>
-                err ? rej(err) : res(stdout),
-              ),
-            ).catch(() => "");
-            const worktrees = parseWorktreeList(config.root, rawWorktreeListOutput);
+  return {
+    projectFolderEntries,
+    explicitProjectsMap,
+    stripRoots: validationResult.data.stripRoots,
+  };
+};
+type ConfigData = NonNullable<Awaited<ReturnType<typeof readConfig>>>;
 
-            if (worktrees.length == 0) {
-              return [
-                {
-                  name,
-                  directory: config.root,
-                  getSubProjects: null,
-                  branch: "not a git repository",
-                  isDirty: false,
-                },
-              ];
-            }
+const getProjects = async (configData: ConfigData): Promise<ProjectDirectory[] | null> => {
+  const projects = (
+    await Promise.all(
+      configData.projectFolderEntries.map(async ([projectName, config]) => {
+        const [worktrees, remoteUrl] = await Promise.all([
+          getProjectWorktrees(config.root),
+          getRemoteGitUrl(config.root),
+        ]);
 
-            return await Promise.all(
-              worktrees.map(async (worktree) => {
-                const isDirty = await new Promise<boolean>((res, rej) =>
-                  exec(`git status --short`, { cwd: worktree.directory }, (err, stdout) => {
-                    if (err) rej(err);
-                    else res(stdout ? true : false);
-                  }),
-                ).catch(() => false);
-
-                return {
-                  name: worktree.branch || worktree.head || "Bare",
-                  directory: worktree.directory,
-                  getSubProjects: null,
-                  branch: worktree.branch || worktree.head || "Bare",
-                  isDirty,
-                };
-              }),
-            );
-          };
-          const [subprojects, remoteUrl] = await Promise.all([getSubProjects(), getRemoteGitUrl(config.root)]);
-
-          return {
-            name,
-            directory: config.root,
-            subProjects: subprojects.map((subProject) => ({ ...subProject, remoteUrl })),
-            branch: null,
+        return worktrees
+          .filter((worktree) => worktree.isGitRepo || configData.explicitProjectsMap.has(config.root))
+          .map((worktree) => ({
+            name: projectName,
             remoteUrl,
-          } satisfies ProjectDirectory;
-        }),
-      )
-    : [];
+            ...worktree,
+          }));
+      }),
+    )
+  ).flat();
 
   return projects;
 };
 
-const getProjectActions = ({ project }: { project: ProjectDirectory }) => {
-  return [
-    <Action.Open
-      title="Open with Code"
-      icon={Icon.Code}
-      application={"/Applications/Visual Studio Code.app"}
-      target={project.directory}
-    ></Action.Open>,
-    <Action.OpenWith title="Open With…" path={project.directory}></Action.OpenWith>,
-    <Action.ShowInFinder title="Show in Finder" path={project.directory}></Action.ShowInFinder>,
-    <>
-      {project.remoteUrl && (
-        <Action.OpenInBrowser
-          title="Open Repository"
-          url={project.remoteUrl.httpUrl}
-          shortcut={{ key: "o", modifiers: ["cmd"] }}
-        ></Action.OpenInBrowser>
-      )}
-    </>,
-    <Action.CopyToClipboard
-      title="Copy Folder Path"
-      shortcut={{ key: "c", modifiers: ["cmd"] }}
-      content={project.directory}
-    ></Action.CopyToClipboard>,
-    <>
-      {project.branch ? (
-        <Action.CopyToClipboard
-          title="Copy Branch"
-          shortcut={{ key: "c", modifiers: ["cmd", "shift"] }}
-          content={project.branch}
-        ></Action.CopyToClipboard>
-      ) : (
-        <></>
-      )}
-    </>,
-  ];
+const ProjectActionPanel = ({ project }: { project: ProjectDirectory }) => {
+  return (
+    <ActionPanel title={path.basename(project.directory)}>
+      {/* TODO: make this dynamic: allow to open with any installed editor (check individually) */}
+      <Action.Open
+        title="Open with Code"
+        icon={Icon.Code}
+        application={"/Applications/Visual Studio Code.app"}
+        target={project.directory}
+      ></Action.Open>
+      <Action.OpenWith title="Open With…" path={project.directory}></Action.OpenWith>
+      <Action.ShowInFinder title="Show in Finder" path={project.directory}></Action.ShowInFinder>
+      <>
+        {project.remoteUrl && (
+          <Action.OpenInBrowser
+            title="Open Repository"
+            url={project.remoteUrl.httpUrl}
+            shortcut={{ key: "o", modifiers: ["cmd"] }}
+          ></Action.OpenInBrowser>
+        )}
+      </>
+      <Action.CopyToClipboard
+        title="Copy Folder Path"
+        shortcut={{ key: "c", modifiers: ["cmd"] }}
+        content={project.directory}
+      ></Action.CopyToClipboard>
+      <>
+        {project.branch ? (
+          <Action.CopyToClipboard
+            title="Copy Branch"
+            shortcut={{ key: "c", modifiers: ["cmd", "shift"] }}
+            content={project.branch}
+          ></Action.CopyToClipboard>
+        ) : (
+          <></>
+        )}
+      </>
+    </ActionPanel>
+  );
 };
 
-const ProjectList = ({
-  projectsResult,
-}: {
-  projectsResult: Pick<UseCachedPromiseReturnType<ProjectDirectory[] | null, undefined>, "isLoading" | "data">;
-}) => {
-  const flatProjects = projectsResult?.data?.flatMap((project) => {
-    return (
-      project.subProjects?.map<ProjectDirectory & { isMainWorktree: boolean; isDirty: boolean }>((subProject) => ({
-        name: project.name,
-        directory: subProject.directory,
-        branch: subProject.branch,
-        isMainWorktree: project.directory == subProject.directory,
-        getSubProjects: null,
-        isDirty: subProject.isDirty,
-        remoteUrl: subProject.remoteUrl,
-      })) || []
-    );
+export default function Command() {
+  const projectsResult = useCachedPromise(async () => {
+    const config = await readConfig(configFilePath);
+    if (!config) return null;
+
+    const projects = await getProjects(config);
+
+    return { config, projects };
   });
+
+  const projects = projectsResult?.data?.projects;
+  const stripRoots = projectsResult?.data?.config?.stripRoots || [];
 
   return (
     <List isLoading={projectsResult?.isLoading}>
-      {flatProjects?.length ? (
-        flatProjects.map((project) => (
+      {projects?.length ? (
+        projects.map((project) => (
           <List.Item
             key={project.name + project.directory}
-            title={project.name.replace(/_|-/g, " ") + (project.isDirty ? " 🚧" : "")}
-            subtitle={`<${project.branch}>   ${project.directory.replace(baseProjectPath, "")}`}
+            title={
+              project.name.replace(/_|-/g, " ") + (project.isDirty ? " 🚧" : "") + (project.isMainWorktree ? " 📍" : "")
+            }
+            subtitle={`<${project.branch}>   ${cleanProjectDirectoryDisplay(project.directory, stripRoots)}`}
             keywords={[
               project.name,
               ...(project.branch?.split(/\W|_/) || []),
               project.branch || "",
-              ...project.directory.replace(baseProjectPath, "").split("/"),
+              ...cleanProjectDirectoryDisplay(project.directory, stripRoots).split("/"),
             ]}
-            actions={<ActionPanel>{...getProjectActions({ project })}</ActionPanel>}
+            actions={<ProjectActionPanel project={project} />}
           />
         ))
       ) : (
@@ -291,10 +335,4 @@ const ProjectList = ({
       )}
     </List>
   );
-};
-
-export default function Command() {
-  const projectsResult = useCachedPromise(getProjects);
-
-  return <ProjectList projectsResult={projectsResult} />;
 }
