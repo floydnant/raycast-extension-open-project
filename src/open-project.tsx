@@ -1,4 +1,4 @@
-import { Action, ActionPanel, Alert, confirmAlert, Icon, List, showToast, Toast, trash } from "@raycast/api";
+import { Action, ActionPanel, Alert, confirmAlert, Icon, List, showToast, Toast, trash, Detail } from "@raycast/api";
 import { showFailureToast, useCachedPromise } from "@raycast/utils";
 import { exec } from "child_process";
 import fs from "fs/promises";
@@ -89,6 +89,7 @@ type ProjectWorktree = {
   directory: string;
   branch: string;
   isDirty: boolean | null;
+  gitStatus: string | null;
   isMainWorktree: boolean;
   isGitRepo: boolean;
   mainWorktreeDirectory: string;
@@ -150,6 +151,7 @@ const getProjectWorktrees = async (directory: string): Promise<ProjectWorktree[]
         directory: directory,
         branch: "not a git repository",
         isDirty: false,
+        gitStatus: null,
         isMainWorktree: true,
         isGitRepo: false,
         mainWorktreeDirectory: directory,
@@ -159,23 +161,25 @@ const getProjectWorktrees = async (directory: string): Promise<ProjectWorktree[]
 
   const projectWorktrees = await Promise.all(
     worktrees.map(async (worktree) => {
-      const [isDirty, exists] = await Promise.all([
-        new Promise<boolean>((res, _rej) =>
-          exec(`git status --short`, { cwd: worktree.directory }, (err, stdout) => {
-            if (err) res(false);
-            else res(stdout ? true : false);
+      const [gitStatusStdout, exists] = await Promise.all([
+        new Promise<string>((res, _rej) =>
+          exec(`git status --short -u`, { cwd: worktree.directory }, (err, stdout) => {
+            if (err) res("");
+            else res(stdout);
           }),
-        ).catch(() => false),
+        ).catch(() => ""),
         fs
           .stat(worktree.directory)
           .then(() => true)
           .catch(() => false),
       ]);
+      const isDirty = gitStatusStdout.trim().length > 0 ? true : false;
 
       return {
         exists: exists,
         directory: worktree.directory,
         branch: worktree.branch || worktree.head || "Bare",
+        gitStatus: gitStatusStdout.trimEnd(),
         isDirty: isDirty,
         isMainWorktree: worktree.isMainWorktree,
         isGitRepo: true,
@@ -285,9 +289,11 @@ const getProjects = async (configData: ConfigData): Promise<ProjectDirectory[] |
 const ProjectActionPanel = ({
   project,
   onDelete,
+  showGitStatus = true,
 }: {
   project: ProjectDirectory;
   onDelete: (project: ProjectDirectory) => void;
+  showGitStatus?: boolean;
 }) => {
   return (
     <ActionPanel title={path.basename(project.directory)}>
@@ -299,7 +305,33 @@ const ProjectActionPanel = ({
         target={project.directory}
       ></Action.Open>
       <Action.OpenWith title="Open With…" path={project.directory}></Action.OpenWith>
-      <Action.ShowInFinder title="Show in Finder" path={project.directory}></Action.ShowInFinder>
+      <Action.ShowInFinder
+        title="Reveal in Finder"
+        path={project.directory}
+        shortcut={{ key: "r", modifiers: ["cmd", "shift"] }}
+      ></Action.ShowInFinder>
+
+      {showGitStatus && (
+        <Action.Push
+          title="Git Status"
+          icon={Icon.Eye}
+          shortcut={{ key: "p", modifiers: ["ctrl"] }}
+          target={
+            <Detail
+              navigationTitle="Git Status"
+              actions={ProjectActionPanel({ project, onDelete, showGitStatus: false })}
+              markdown={`
+# ${path.basename(project.directory)} \`${project.branch}\`
+${project.directory} ${project.isDirty ? " 🚧" : ""} ${project.isMainWorktree ? " 📍" : ""}
+\`\`\`
+${project.isDirty ? project.gitStatus : "--"}
+\`\`\`
+`}
+            />
+          }
+        ></Action.Push>
+      )}
+
       <>
         {project.remoteUrl && (
           <Action.OpenInBrowser
