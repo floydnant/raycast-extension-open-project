@@ -178,7 +178,7 @@ const getProjectWorktrees = async (directory: string): Promise<ProjectWorktree[]
       return {
         exists: exists,
         directory: worktree.directory,
-        branch: worktree.branch || worktree.head || "Bare",
+        branch: worktree.branch || worktree.head?.slice(0, 7) || "Bare",
         gitStatus: gitStatusStdout.trimEnd(),
         isDirty: isDirty,
         isMainWorktree: worktree.isMainWorktree,
